@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import logging
+import functools
 from abc import ABC, abstractmethod
 from typing import Any, Union, Generic, TypeVar, Callable, Iterable, Coroutine, cast, overload
 from inspect import isawaitable, isasyncgenfunction, iscoroutinefunction, isgeneratorfunction
@@ -68,6 +69,58 @@ FunctionT = TypeVar("FunctionT", bound=Function)
 
 AsyncFunction = Callable[..., Coroutine[Any, Any, BetaFunctionToolResultType]]
 AsyncFunctionT = TypeVar("AsyncFunctionT", bound=AsyncFunction)
+
+
+class _ToolBodyValidationError(Exception):
+    """Marker for a `ValidationError` raised by the tool body, not by argument validation.
+
+    `pydantic.validate_call` validates the arguments and then calls the function in one step, so a
+    `ValidationError` raised inside the body (for example while constructing a model from bad data) is
+    indistinguishable from one raised because the model's arguments were wrong. Wrapping the body lets us tell
+    them apart and re-raise the body's error unchanged instead of reporting it as a bad tool call.
+    """
+
+    def __init__(self, error: pydantic.ValidationError) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _wrap_body_validation_errors(func: FunctionT) -> FunctionT:
+    """Re-raise a `ValidationError` from inside `func` as `_ToolBodyValidationError` so argument validation (which
+    `validate_call` runs before calling `func`) stays distinguishable from it."""
+    if iscoroutinefunction(func):
+
+        @functools.wraps(func)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await func(*args, **kwargs)
+            except pydantic.ValidationError as e:
+                raise _ToolBodyValidationError(e) from e
+
+        return cast(FunctionT, async_wrapper)
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except pydantic.ValidationError as e:
+            raise _ToolBodyValidationError(e) from e
+
+    return cast(FunctionT, wrapper)
+
+
+def _validation_error_summary(exc: pydantic.ValidationError) -> str:
+    """The field errors of `exc` as one short line, e.g. `celsius: Input should be a valid integer`.
+
+    Only the location and message are included: the input values pydantic reports alongside them are model-supplied
+    and can be large or contain characters that don't belong in a tool result.
+    """
+    parts: list[str] = []
+    for error in exc.errors():
+        loc = ".".join(str(part) for part in error["loc"])
+        message = error["msg"]
+        parts.append(f"{loc}: {message}" if loc else message)
+    return "; ".join(parts)
 
 
 class BetaBuiltinFunctionTool(ABC):
@@ -165,7 +218,7 @@ class BaseFunctionTool(Generic[CallableT]):
             raise RuntimeError("Tool functions are only supported with Pydantic v2")
 
         self.func = func
-        self._func_with_validate = pydantic.validate_call(func)
+        self._func_with_validate = pydantic.validate_call(_wrap_body_validation_errors(func))
         self.name = name or func.__name__
         self._defer_loading = defer_loading
         self._cache_control = cache_control
@@ -279,8 +332,10 @@ class BetaFunctionTool(BaseFunctionTool[FunctionT]):
 
         try:
             return self._func_with_validate(**cast(Any, input))
+        except _ToolBodyValidationError as e:
+            raise e.error from None
         except pydantic.ValidationError as e:
-            raise ValueError(f"Invalid arguments for function {self.name}") from e
+            raise ValueError(f"Invalid arguments for function {self.name}: {_validation_error_summary(e)}") from e
 
 
 class BetaAsyncFunctionTool(BaseFunctionTool[AsyncFunctionT]):
@@ -293,8 +348,10 @@ class BetaAsyncFunctionTool(BaseFunctionTool[AsyncFunctionT]):
 
         try:
             return await self._func_with_validate(**cast(Any, input))
+        except _ToolBodyValidationError as e:
+            raise e.error from None
         except pydantic.ValidationError as e:
-            raise ValueError(f"Invalid arguments for function {self.name}") from e
+            raise ValueError(f"Invalid arguments for function {self.name}: {_validation_error_summary(e)}") from e
 
 
 def _is_sync_cm_factory(fn: object) -> bool:
